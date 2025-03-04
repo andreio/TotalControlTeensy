@@ -43,14 +43,60 @@ enum MSG_ACTION : byte {
   LONG_PRESS_RELEASE,
   TAP
 };
-enum LoopToggle : byte {
+enum LOOP_TOGGLE : byte {
   UNCHANGED,
   SET,
   UNSET,
   TOGGLE,
 };
 
-typedef LoopToggle Loops[9];
+enum NEXTION_RETURN { TOUCH_EVENT = 0x65 };
+enum NEXTION_BUTTONS {
+  EDIT = 3,
+  COPY = 4,
+  PASTE = 5,
+  BANK_UP = 6,
+  BANK_DOWN = 7,
+  PAGE_LEFT = 8,
+  PAGE_RIGHT = 9,
+  SETTINGS = 10,
+  P0 = 21,
+  P1 = 22,
+  P2 = 23,
+  P3 = 24,
+  P4 = 25,
+  P5 = 26,
+  P6 = 27,
+  P7 = 28,
+  L0 = 11,
+  L1 = 12,
+  L2 = 13,
+  L3 = 14,
+  L4 = 15,
+  L5 = 17,
+  L6 = 18,
+  L7 = 19,
+  L8 = 20,
+  TAP_BTN = 36
+};
+
+enum MIDI_IN_CC : byte {
+  BANK_MOVE_CC,
+  PAGE_MOVE_CC,
+  BANK_CC,
+  PAGE_CC,
+  TAP_MOVE_CC,
+  TAP_CC,
+};
+
+enum NEXTION_PAGE {
+  MAIN_PAGE = 0,
+  PERF1_PAGE = 1,
+  PERF2_PAGE = 2,
+  TAP_PAGE = 3
+};
+
+typedef LOOP_TOGGLE Loops[9];
 
 typedef struct {
   MSG_TYPE type = NONE_TYPE;
@@ -97,6 +143,16 @@ typedef struct {
   RackPreset preset;
 } RackState;
 
+typedef ControllerPreset BankPresets[8];
+
+typedef struct {
+  BankPresets presets;
+  PresetName name;
+  uint8_t index;
+} PseudoBank;
+
+PseudoBank currentBank = {{}, "", 0};
+
 // VARS/CONSTS
 
 const uint8_t FRAM_CS = 10;
@@ -110,6 +166,22 @@ Bounce2::Button bounces[8];
 const uint SYSEX_START = 0xf0;
 const uint SYSEX_STOP = 0xf7;
 const uint SYSEX_DEV = 23;
+
+const uint8_t NT = 255;
+
+uint8_t nextionBuffer[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+uint8_t nextionBufferLength = 0;
+uint8_t NTCount = 0;
+const uint8_t MAX_NT = 3;
+uint8_t nextionPage = 0;
+uint8_t nextionBlinks[3] = {0, 0, 0};
+const int NEXTION_LOW_BAUD = 9600;
+const int NEXTION_HIGH_BAUD = 921600;
+
+double lastTapMs = 0;
+int tapValue = 1000;
+bool tapSent = false;
+int tapTimeoutMs = 2000;
 
 MIDI_CREATE_INSTANCE(HardwareSerial, Serial1, MIDI);
 Adafruit_FRAM_SPI fram = Adafruit_FRAM_SPI(FRAM_CS);
@@ -140,6 +212,20 @@ void sendState(uint8_t index, uint32_t presetsAddress, uint32_t banksAddress,
                RESPONSE_TYPES responseType);
 void receiveRackLoopNames(PresetName loopNames[9]);
 void sendRackLoopNames();
+void selectBank(uint8_t index);
+void updateUI();
+void processNextionBuffer();
+void updateNextionBuffer();
+void processNextionTouch();
+void setupNextion();
+void setNextionPageRolled(uint8_t page);
+void setNextionPageAbsolute(uint8_t page);
+void updateNextionBlink(uint8_t index);
+void updateNextionBlinks();
+void onControlChange(uint8_t channel, uint8_t control, uint8_t value);
+void processTap();
+void updateTap();
+void sendTap();
 
 // MEMORY LOCATIONS
 const uint32_t CONTROLLER_PRESETS_ADDRESS = 1000;
@@ -153,24 +239,27 @@ void setup() {
   Serial.begin(9600);
   setupSwitches();
   MIDI.turnThruOff();
-#ifdef usbMIDI
+  MIDI.setHandleControlChange(onControlChange);
   usbMIDI.begin();
   usbMIDI.setHandleSysEx(onSysex);
-#endif
   fram.begin();
+  setupNextion();
 }
 
 void loop() {
+  MIDI.read();
+  usbMIDI.read();
   for (uint i = 0; i < SWITCH_COUNT; i++) {
     Bounce2::Button *sw = &bounces[i];
     sw->update();
     if (sw->changed()) {
-      Serial.println("Clicked");
+      if (sw->read()) {
+        updateNextionBlink(i);
+      }
     }
   }
-#ifdef usbMIDI
-  usbMIDI.read();
-#endif
+  updateNextionBuffer();
+  processTap();
 }
 
 void setupSwitches() {
@@ -196,11 +285,14 @@ void onSysex(const uint8_t *data, uint16_t length, bool complete) {
   switch (request) {
   case SEND_CONTROLLER_PRESET_STATE: {
     receiveControllerState((ControllerState *)buffer);
+    uint8_t index = ((ControllerState *)buffer)->index;
+    selectBank(index / 8);
     break;
   }
   case REQUEST_CONTROLLER_PRESET_STATE: {
     uint8_t index = buffer[0];
     sendControllerState(index);
+    selectBank(index / 8);
     break;
   }
   case REQUEST_CONTROLLER_PRESET_IDS: {
@@ -222,6 +314,7 @@ void onSysex(const uint8_t *data, uint16_t length, bool complete) {
   }
   case SEND_RACK_LOOP_NAMES: {
     receiveRackLoopNames((PresetName *)buffer);
+    updateUI();
     break;
   }
   case REQUEST_RACK_LOOP_NAMES: {
@@ -237,6 +330,7 @@ void onSysex(const uint8_t *data, uint16_t length, bool complete) {
     break;
   }
   }
+  usbMIDI.send_now();
 }
 
 void receiveControllerState(ControllerState *buffer) {
@@ -283,7 +377,7 @@ void sendRackState(uint8_t index) {
 }
 
 void sendRackLoopNames() {
-  PresetName loopNames[9];
+  PresetName loopNames[9] = {};
   fram.read(RACK_LOOP_NAMES_ADDRESS, (uint8_t *)loopNames,
             sizeof(PresetName[9]));
   sendResponse((uint8_t *)loopNames, RECEIVE_RACK_LOOP_NAMES,
@@ -291,10 +385,10 @@ void sendRackLoopNames() {
 }
 
 void reset() {
-  ControllerPreset controllerPreset;
-  RackPreset rackPreset;
-  PresetName controllerBank;
-  PresetName rackBank;
+  ControllerPreset controllerPreset = {};
+  RackPreset rackPreset = {};
+  PresetName controllerBank = {};
+  PresetName rackBank = {};
   for (int i = 0; i < 128; i++) {
     const uint8_t program = i % 8;
     snprintf(controllerPreset.presetName, sizeof(PresetName), "P%d", program);
@@ -316,23 +410,21 @@ void reset() {
       snprintf(rackBank, sizeof(PresetName), "RB%d", bank);
       fram.writeEnable(true);
       fram.write(CONTROLLER_BANK_NAMES_ADDRESS + sizeof(PresetName) * bank,
-                 (uint8_t *)controllerBank, sizeof(PresetName));
+                 (uint8_t *)(&controllerBank), sizeof(PresetName));
       fram.writeEnable(false);
       fram.writeEnable(true);
       fram.write(RACK_BANK_NAMES_ADDRESS + sizeof(PresetName) * bank,
-                 (uint8_t *)rackBank, sizeof(PresetName));
+                 (uint8_t *)(&rackBank), sizeof(PresetName));
       fram.writeEnable(false);
     }
   }
 }
 
 void sendResponse(uint8_t *data, RESPONSE_TYPES responseType, size_t dataSize) {
-  uint8_t response[dataSize + 2];
+  uint8_t response[dataSize + 2] = {};
   insertSysexConstants(response, responseType);
   memcpy(response + 2, data, dataSize);
-#ifdef usbMIDI
   usbMIDI.sendSysEx(dataSize + 2, response);
-#endif
 }
 
 void insertSysexConstants(uint8_t *buffer, RESPONSE_TYPES responseType) {
@@ -352,7 +444,7 @@ REQUEST_TYPES getRequestType(const uint8_t *buffer) {
 template <typename T, typename P>
 void receiveState(T *buffer, uint32_t presetsAddress, uint32_t banksAddress) {
   fram.writeEnable(true);
-  fram.write(banksAddress + sizeof(PresetName) * (buffer->index),
+  fram.write(banksAddress + sizeof(PresetName) * (buffer->index / 8),
              (uint8_t *)buffer->bankName, sizeof(PresetName));
   fram.writeEnable(false);
   fram.writeEnable(true);
@@ -364,7 +456,7 @@ void receiveState(T *buffer, uint32_t presetsAddress, uint32_t banksAddress) {
 template <typename T>
 void sendPresetIds(uint32_t presetAddress, uint32_t bankAddress,
                    RESPONSE_TYPES responseType) {
-  PresetID presetIds[128];
+  PresetID presetIds[128] = {};
   int presetNameOffset = offsetof(T, presetName);
   for (uint8_t i = 0; i < 128; i++) {
     presetIds[i].index = i;
@@ -385,6 +477,221 @@ void sendState(uint8_t index, uint32_t presetsAddress, uint32_t banksAddress,
   fram.read(banksAddress + sizeof(PresetName) * (index / 8),
             (uint8_t *)controllerState.bankName, sizeof(PresetName));
   controllerState.index = index;
-  sendResponse((uint8_t *)&controllerState, responseType,
+  sendResponse((uint8_t *)(&controllerState), responseType,
                sizeof(controllerState));
+}
+
+// UI
+
+void selectBank(uint8_t index) {
+  index = (16 + index) % 16;
+  fram.read(CONTROLLER_PRESETS_ADDRESS + sizeof(ControllerPreset) * index * 8,
+            (uint8_t *)&(currentBank.presets), sizeof(ControllerPreset) * 8);
+  fram.read(CONTROLLER_BANK_NAMES_ADDRESS + sizeof(PresetName) * index,
+            (uint8_t *)&(currentBank.name), sizeof(PresetName));
+  currentBank.index = index;
+  updateUI();
+}
+
+void updateUI() {
+  switch (nextionPage) {
+  case MAIN_PAGE:
+    for (int i = 0; i < 8; i++) {
+      Serial2.printf("loop%d.txt=\"%s\"", i, currentBank.presets[i].presetName);
+      Serial2.write(NT);
+      Serial2.write(NT);
+      Serial2.write(NT);
+    }
+    Serial2.printf("pInf0.txt=\"Bank %d\"", currentBank.index);
+    Serial2.write(NT);
+    Serial2.write(NT);
+    Serial2.write(NT);
+    Serial2.printf("pInf1.txt=\"%s\"", currentBank.name);
+    Serial2.write(NT);
+    Serial2.write(NT);
+    Serial2.write(NT);
+    break;
+
+  case PERF1_PAGE:
+    PresetName loopNames[8] = {};
+    fram.read(RACK_LOOP_NAMES_ADDRESS, (uint8_t *)loopNames,
+              sizeof(PresetName) * 8);
+    for (int i = 0; i < 8; i++) {
+      Serial2.printf("loop%d.txt=\"%s\"", i, loopNames[i]);
+      Serial2.write(NT);
+      Serial2.write(NT);
+      Serial2.write(NT);
+    }
+    break;
+  }
+}
+
+void processNextionBuffer() {
+  NEXTION_RETURN nextionReturn = (NEXTION_RETURN)nextionBuffer[0];
+  switch (nextionReturn) {
+  case TOUCH_EVENT:
+    processNextionTouch();
+    break;
+  }
+}
+
+void processNextionTouch() {
+  uint8_t pageNumber = nextionBuffer[1];
+  NEXTION_BUTTONS button = (NEXTION_BUTTONS)nextionBuffer[2];
+  bool toggle = nextionBuffer[3];
+  switch (button) {
+  case BANK_UP:
+    if (!toggle && pageNumber == MAIN_PAGE) {
+      selectBank(currentBank.index + 1);
+    }
+
+    break;
+  case BANK_DOWN:
+    if (!toggle && pageNumber == MAIN_PAGE) {
+      selectBank(currentBank.index - 1);
+    }
+    break;
+  case PAGE_LEFT:
+    if (!toggle) {
+    }
+    setNextionPageRolled(nextionPage - 1);
+    break;
+  case PAGE_RIGHT:
+    if (!toggle) {
+    }
+    setNextionPageRolled(nextionPage + 1);
+    break;
+  case TAP_BTN:
+    updateTap();
+    break;
+  }
+  Serial.printf("Page %d; button: %d: state: %d", pageNumber, button, toggle);
+  Serial.println();
+}
+
+void updateNextionBuffer() {
+  while (Serial2.available()) {
+    uint8_t nextByte = Serial2.read();
+    nextionBuffer[nextionBufferLength] = nextByte;
+    nextionBufferLength++;
+    if (nextByte == NT) {
+      NTCount++;
+    }
+    if (NTCount == MAX_NT) {
+      nextionBufferLength -= MAX_NT;
+      processNextionBuffer();
+      nextionBufferLength = 0;
+      NTCount = 0;
+      for (uint8_t i = 0; i < 10; i++) {
+        nextionBuffer[i] = 0;
+      }
+      return;
+    }
+  }
+}
+
+void setupNextion() {
+  Serial2.begin(NEXTION_LOW_BAUD);
+  Serial2.printf("baud=%d", NEXTION_HIGH_BAUD);
+  Serial2.write(NT);
+  Serial2.write(NT);
+  Serial2.write(NT);
+  Serial2.end();
+  Serial2.begin(NEXTION_HIGH_BAUD);
+  selectBank(0);
+}
+
+void setNextionPageAbsolute(uint8_t page) {
+  Serial2.printf("page %d", page);
+  Serial2.write(NT);
+  Serial2.write(NT);
+  Serial2.write(NT);
+  nextionPage = page;
+  updateUI();
+  updateNextionBlinks();
+  sendTap();
+}
+
+void setNextionPageRolled(uint8_t page) {
+  setNextionPageAbsolute((3 + page) % 3);
+}
+
+void updateNextionBlink(uint8_t index) {
+  nextionBlinks[nextionPage] = nextionBlinks[nextionPage] ^ (1 << index);
+  updateNextionBlinks();
+}
+
+void updateNextionBlinks() {
+  Serial2.printf("blink.val=%d", nextionBlinks[nextionPage]);
+  Serial2.write(NT);
+  Serial2.write(NT);
+  Serial2.write(NT);
+}
+
+// MIDI IN
+void onControlChange(uint8_t channel, uint8_t control, uint8_t value) {
+  Serial.printf("Channel%dControl%dvalue%d", channel, control, value);
+  switch ((MIDI_IN_CC)control) {
+  case BANK_MOVE_CC:
+    if (value) {
+      selectBank(currentBank.index + 1);
+    } else {
+      selectBank(currentBank.index - 1);
+    }
+    break;
+  case BANK_CC: {
+    selectBank(value);
+    break;
+  }
+  case PAGE_MOVE_CC:
+    if (control) {
+      setNextionPageRolled(nextionPage + 1);
+    } else {
+      setNextionPageRolled(nextionPage - 1);
+    }
+    break;
+  case PAGE_CC:
+    setNextionPageRolled(value);
+    break;
+  case TAP_MOVE_CC:
+    setNextionPageAbsolute(value);
+    break;
+  case TAP_CC:
+    updateTap();
+    break;
+  }
+}
+
+void updateTap() {
+  tapSent = false;
+  double ms = millis();
+  if (lastTapMs) {
+    tapValue = (tapValue + (ms - lastTapMs)) / 2;
+  }
+  lastTapMs = ms;
+  Serial.printf("Tapping...%d", tapValue);
+}
+
+void processTap() {
+  double ms = millis();
+  double diff = ms - lastTapMs;
+  if (diff > tapTimeoutMs) {
+    lastTapMs=0;
+    return;
+  }
+  if (!tapSent) {
+    sendTap();
+    tapSent = true;
+  };
+}
+
+void sendTap() {
+  Serial2.printf("pInf2.txt=\"%d\"", tapValue);
+  Serial2.write(NT);
+  Serial2.write(NT);
+  Serial2.write(NT);
+  Serial2.printf("tap_timer.tim=%d", tapValue);
+  Serial2.write(NT);
+  Serial2.write(NT);
+  Serial2.write(NT);
 }
