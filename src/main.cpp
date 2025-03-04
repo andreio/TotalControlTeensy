@@ -3,8 +3,15 @@
 #include <Bounce2.h>
 #include <MIDI.h>
 
-// Types
+#define NT 255
+#define NEXTION Serial2
+#define NEXTION_PRINT(...)                                                     \
+  NEXTION.printf(__VA_ARGS__);                                                 \
+  NEXTION.write(NT);                                                           \
+  NEXTION.write(NT);                                                           \
+  NEXTION.write(NT);
 
+// Types
 enum REQUEST_TYPES : byte {
   REQUEST_CONTROLLER_PRESET_STATE,
   SEND_CONTROLLER_PRESET_STATE,
@@ -166,8 +173,6 @@ Bounce2::Button bounces[8];
 const uint SYSEX_START = 0xf0;
 const uint SYSEX_STOP = 0xf7;
 const uint SYSEX_DEV = 23;
-
-const uint8_t NT = 255;
 
 uint8_t nextionBuffer[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 uint8_t nextionBufferLength = 0;
@@ -497,19 +502,10 @@ void updateUI() {
   switch (nextionPage) {
   case MAIN_PAGE:
     for (int i = 0; i < 8; i++) {
-      Serial2.printf("loop%d.txt=\"%s\"", i, currentBank.presets[i].presetName);
-      Serial2.write(NT);
-      Serial2.write(NT);
-      Serial2.write(NT);
+      NEXTION_PRINT("loop%d.txt=\"%s\"", i, currentBank.presets[i].presetName);
     }
-    Serial2.printf("pInf0.txt=\"Bank %d\"", currentBank.index);
-    Serial2.write(NT);
-    Serial2.write(NT);
-    Serial2.write(NT);
-    Serial2.printf("pInf1.txt=\"%s\"", currentBank.name);
-    Serial2.write(NT);
-    Serial2.write(NT);
-    Serial2.write(NT);
+    NEXTION_PRINT("pInf0.txt=\"Bank %d\"", currentBank.index);
+    NEXTION_PRINT("pInf1.txt=\"%s\"", currentBank.name);
     break;
 
   case PERF1_PAGE:
@@ -517,10 +513,7 @@ void updateUI() {
     fram.read(RACK_LOOP_NAMES_ADDRESS, (uint8_t *)loopNames,
               sizeof(PresetName) * 8);
     for (int i = 0; i < 8; i++) {
-      Serial2.printf("loop%d.txt=\"%s\"", i, loopNames[i]);
-      Serial2.write(NT);
-      Serial2.write(NT);
-      Serial2.write(NT);
+      NEXTION_PRINT("loop%d.txt=\"%s\"", i, loopNames[i]);
     }
     break;
   }
@@ -570,8 +563,8 @@ void processNextionTouch() {
 }
 
 void updateNextionBuffer() {
-  while (Serial2.available()) {
-    uint8_t nextByte = Serial2.read();
+  while (NEXTION.available()) {
+    uint8_t nextByte = NEXTION.read();
     nextionBuffer[nextionBufferLength] = nextByte;
     nextionBufferLength++;
     if (nextByte == NT) {
@@ -591,21 +584,15 @@ void updateNextionBuffer() {
 }
 
 void setupNextion() {
-  Serial2.begin(NEXTION_LOW_BAUD);
-  Serial2.printf("baud=%d", NEXTION_HIGH_BAUD);
-  Serial2.write(NT);
-  Serial2.write(NT);
-  Serial2.write(NT);
-  Serial2.end();
-  Serial2.begin(NEXTION_HIGH_BAUD);
+  NEXTION.begin(NEXTION_LOW_BAUD);
+  NEXTION_PRINT("baud=%d", NEXTION_HIGH_BAUD);
+  NEXTION.end();
+  NEXTION.begin(NEXTION_HIGH_BAUD);
   selectBank(0);
 }
 
 void setNextionPageAbsolute(uint8_t page) {
-  Serial2.printf("page %d", page);
-  Serial2.write(NT);
-  Serial2.write(NT);
-  Serial2.write(NT);
+  NEXTION_PRINT("page %d", page);
   nextionPage = page;
   updateUI();
   updateNextionBlinks();
@@ -622,10 +609,7 @@ void updateNextionBlink(uint8_t index) {
 }
 
 void updateNextionBlinks() {
-  Serial2.printf("blink.val=%d", nextionBlinks[nextionPage]);
-  Serial2.write(NT);
-  Serial2.write(NT);
-  Serial2.write(NT);
+  NEXTION_PRINT("blink.val=%d", nextionBlinks[nextionPage]);
 }
 
 // MIDI IN
@@ -676,7 +660,7 @@ void processTap() {
   double ms = millis();
   double diff = ms - lastTapMs;
   if (diff > tapTimeoutMs) {
-    lastTapMs=0;
+    lastTapMs = 0;
     return;
   }
   if (!tapSent) {
@@ -686,12 +670,6 @@ void processTap() {
 }
 
 void sendTap() {
-  Serial2.printf("pInf2.txt=\"%d\"", tapValue);
-  Serial2.write(NT);
-  Serial2.write(NT);
-  Serial2.write(NT);
-  Serial2.printf("tap_timer.tim=%d", tapValue);
-  Serial2.write(NT);
-  Serial2.write(NT);
-  Serial2.write(NT);
+  NEXTION_PRINT("pInf2.txt=\"%d\"", tapValue);
+  NEXTION_PRINT("tap_timer.tim=%d", tapValue);
 }
